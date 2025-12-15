@@ -1,0 +1,9 @@
+venv/
+.env/
+__pycache__/
+data/
+
+confusion_matrix_text_category.png
+new.csv
+test_results_text_category.csv
+final_nlp_results.csv
