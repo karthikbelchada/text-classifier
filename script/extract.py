@@ -27,6 +27,8 @@ def extract_entities(text):
     doc = nlp(clean_social_copy(text))
 
     dates = []
+    times = []
+    events = []
     persons = []
     companies = []
     locations = []
@@ -34,6 +36,10 @@ def extract_entities(text):
     for ent in doc.ents:
         if ent.label_ == "DATE":
             dates.append(ent.text)
+        elif ent.label_ == "TIME":
+            times.append(ent.text)
+        elif ent.label_ == "EVENT":
+            events.append(ent.text)
         elif ent.label_ == "PERSON":
             persons.append(ent.text)
         elif ent.label_ == "ORG":
@@ -44,6 +50,8 @@ def extract_entities(text):
     return pd.Series(
         {
             "dates": ", ".join(dict.fromkeys(dates)),
+            "times": ", ".join(dict.fromkeys(times)),
+            "events": ", ".join(dict.fromkeys(events)),
             "persons": ", ".join(dict.fromkeys(persons)),
             "companies": ", ".join(dict.fromkeys(companies)),
             "locations": ", ".join(dict.fromkeys(locations)),

@@ -12,45 +12,51 @@ from sklearn.model_selection import GridSearchCV
 
 nlp = spacy.load("en_core_web_lg")
 
-COGNITIVE_TERMS = {
-    "insight",
-    "insights",
-    "takeaways",
-    "learnings",
-    "perspective",
-    "perspectives",
-    "explore",
-    "discussion",
-    "discuss",
-    "reflect",
-    "unpack",
-}
+CONTROL_HEX_PATTERN = re.compile(r"x00[0-9a-f]{2}", re.IGNORECASE)
+TM_NOISE_PATTERN = re.compile(r"\b(tm|tms|tmtm|tmz|tmy|tma)\b", re.IGNORECASE)
 
-PROMO_VERBS = {"register", "sign", "attend", "join", "rsvp", "enroll", "sponsor"}
-HOST_VERBS = {"host", "hosting", "organize", "organizing", "launch", "announce"}
-COMPANY_PRONOUNS = {"we", "our", "us"}
+DATE_PATTERNS = [
+    r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+    r"\b\d{4}\b",
+    r"\b\d+\s+(?:million|billion|thousand)\b",
+    r"\b\d{1,2}:\d{2}\b",
+    r"\b\d{1,2}\s*(?:am|pm)\b",
+]
 
-TRANSACTIONAL_TERMS = {
-    "register",
-    "registration",
-    "sign up",
-    "rsvp",
-    "reserve",
-    "seat",
-    "spot",
-    "ticket",
-    "link",
-}
+DATE_REGEX = re.compile("|".join(DATE_PATTERNS), re.IGNORECASE)
+ISOLATED_NUMBER_PATTERN = re.compile(r"\b\d\b")
+REPEATED_NUMBER_PATTERN = re.compile(r"\b(\d)(\s+\1){2,}\b")
+BROKEN_ALPHA_NUM_PATTERN = re.compile(r"\b(?:[a-z]\s*\d|\d\s*[a-z])\b", re.IGNORECASE)
 
 
 def clean_text(s):
     if pd.isna(s):
         return ""
-    s = html.unescape(str(s))
+    s = str(s)
+    s = html.unescape(s)
     s = unicodedata.normalize("NFKD", s)
-    s = re.sub(r"http\S+|www\S+|lnkd\.in\S+", "", s)
+    s = re.sub(r"http\S+|www\S+|lnkd\.in\S+", " ", s)
+    s = CONTROL_HEX_PATTERN.sub(" ", s)
+    s = TM_NOISE_PATTERN.sub(" ", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
+    protected = {}
+
+    def protect(match):
+        key = f"__NUM_{len(protected)}__"
+        protected[key] = match.group(0)
+        return key
+
+    s = DATE_REGEX.sub(protect, s)
+    s = REPEATED_NUMBER_PATTERN.sub(" ", s)
+    s = ISOLATED_NUMBER_PATTERN.sub(" ", s)
+    s = BROKEN_ALPHA_NUM_PATTERN.sub(" ", s)
     s = re.sub(r"[^a-zA-Z0-9\s,.!?#]", " ", s)
-    return re.sub(r"\s+", " ", s).strip().lower()
+
+    for k, v in protected.items():
+        s = s.replace(k, v)
+
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
 
 
 def normalize_label(s):
@@ -84,35 +90,60 @@ def extract_spacy_features(text):
     return nouns, verbs, orgs, dates, locations
 
 
+def extract_verb_tenses(text):
+    doc = nlp(text)
+    past = sorted(
+        tok.lemma_.lower()
+        for tok in doc
+        if tok.pos_ == "VERB" and "Tense=Past" in tok.morph
+    )
+    present = sorted(
+        tok.lemma_.lower()
+        for tok in doc
+        if tok.pos_ == "VERB" and "Tense=Pres" in tok.morph
+    )
+    return past, present
+
+
 def has_event_metadata(doc):
     return any(ent.label_ in {"DATE", "TIME", "GPE", "LOC"} for ent in doc.ents)
 
 
 def is_company_hosted(doc):
-    return any(tok.text.lower() in COMPANY_PRONOUNS for tok in doc) and any(
-        tok.lemma_.lower() in HOST_VERBS for tok in doc
+    speaker = any(tok.lower_ in {"we", "our", "us"} for tok in doc)
+    present_action = any(
+        tok.pos_ == "VERB" and "Tense=Pres" in tok.morph for tok in doc
     )
+    has_org = any(ent.label_ == "ORG" for ent in doc.ents)
+    return speaker and present_action and has_org
 
 
 def has_basic_promo(doc):
-    return any(tok.lemma_.lower() in PROMO_VERBS for tok in doc)
+    imperative = any(tok.pos_ == "VERB" and "Mood=Imp" in tok.morph for tok in doc)
+    verb_density = sum(tok.pos_ == "VERB" for tok in doc) / max(1, len(doc))
+    return imperative or verb_density > 0.18
 
 
 def has_transactional_intent(text):
-    text = text.lower()
-    return any(term in text for term in TRANSACTIONAL_TERMS)
+    doc = nlp(text)
+    action_root = any(sent.root.pos_ == "VERB" for sent in doc.sents)
+    has_object = any(tok.dep_ in {"dobj", "pobj"} for tok in doc)
+    has_grounding = any(
+        ent.label_ in {"DATE", "TIME", "GPE", "LOC"} for ent in doc.ents
+    )
+    return action_root and has_object and has_grounding
 
 
 def is_idea_focused(text):
-    text = text.lower()
-    return any(term in text for term in COGNITIVE_TERMS)
+    doc = nlp(text)
 
+    abstract_terms = sum(tok.pos_ == "NOUN" and tok.ent_type_ == "" for tok in doc)
 
-def is_retrospective(doc):
-    past_verbs = [
-        tok for tok in doc if tok.pos_ == "VERB" and tok.morph.get("Tense") == ["Past"]
-    ]
-    return len(past_verbs) / max(len(doc), 1) > 0.10
+    promotional_verbs = sum(
+        tok.lemma_.lower() in {"buy", "register", "join", "sign"} for tok in doc
+    )
+
+    return abstract_terms > 4 and promotional_verbs == 0
 
 
 def company_intent_override(text):
@@ -130,18 +161,17 @@ def company_intent_override(text):
 
 
 def intent_resolver(text, base_label):
+    if base_label == "thought leadership" and is_idea_focused(text):
+        return "thought leadership", "idea_dominant"
+
     override, reason = company_intent_override(text)
     if override:
         return override, reason
+
     doc = nlp(text)
-    if (
-        has_basic_promo(doc)
-        and has_event_metadata(doc)
-        and has_transactional_intent(text)
-    ):
-        return "events", "transactional_event_signal"
-    if is_retrospective(doc) and not has_event_metadata(doc):
-        return "thought leadership", "retrospective_no_logistics"
+    if has_transactional_intent(text):
+        return "events", "true_event_signal"
+
     return base_label, "model_fallback"
 
 
@@ -166,6 +196,12 @@ test_df.dropna(subset=["Content Pillar"], inplace=True)
 train_df["Social Copy"] = train_df["Social Copy"].apply(clean_text)
 test_df["Social Copy"] = test_df["Social Copy"].apply(clean_text)
 
+train_df.drop_duplicates(subset=["Social Copy"], inplace=True)
+test_df.drop_duplicates(subset=["Social Copy"], inplace=True)
+
+train_df = train_df[train_df["Social Copy"].str.len() > 10]
+test_df = test_df[test_df["Social Copy"].str.len() > 10]
+
 y_train = train_df["Content Pillar"]
 y_test = test_df["Content Pillar"]
 
@@ -185,11 +221,16 @@ model = grid.best_estimator_
 
 base_preds = pd.Series(model.predict(X_test), index=y_test.index)
 
+ALLOWED_SECOND_LAYER = {"events", "thought leadership"}
+
 final_preds = []
 reasons = []
 
 for text, base in zip(test_df["Social Copy"], base_preds):
-    label, reason = intent_resolver(text, base)
+    if base in ALLOWED_SECOND_LAYER:
+        label, reason = intent_resolver(text, base)
+    else:
+        label, reason = base, "base_only"
     final_preds.append(label)
     reasons.append(reason)
 
@@ -219,25 +260,26 @@ validation_df["Base Prediction"] = base_preds.values
 validation_df["Final Prediction"] = final_preds.values
 validation_df["Resolution Reason"] = reasons
 
-hashtags = []
-nouns = []
-verbs = []
-orgs = []
-dates = []
-locations = []
+hashtags, nouns, verbs, orgs, dates, locations = [], [], [], [], [], []
+past_verbs, present_verbs = [], []
 
 for text in validation_df["Social Copy"]:
     hashtags.append(extract_hashtags(text))
     n, v, o, d, l = extract_spacy_features(text)
+    p, pr = extract_verb_tenses(text)
     nouns.append(n)
     verbs.append(v)
     orgs.append(o)
     dates.append(d)
     locations.append(l)
+    past_verbs.append(p)
+    present_verbs.append(pr)
 
 validation_df["Hashtags"] = hashtags
 validation_df["Nouns"] = nouns
 validation_df["Verbs"] = verbs
+validation_df["Past Tense Verbs"] = past_verbs
+validation_df["Present Tense Verbs"] = present_verbs
 validation_df["Organizations"] = orgs
 validation_df["Dates"] = dates
 validation_df["Locations"] = locations
