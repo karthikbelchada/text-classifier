@@ -109,8 +109,11 @@ def has_event_metadata(doc):
     return any(ent.label_ in {"DATE", "TIME", "GPE", "LOC"} for ent in doc.ents)
 
 
-def is_company_hosted(doc):
-    speaker = any(tok.lower_ in {"we", "our", "us"} for tok in doc)
+def is_company_hosted(doc, company_name):
+    speaker_terms = {"we", "our", "us"}
+    if company_name and str(company_name).strip():
+        speaker_terms.add(str(company_name).lower())
+    speaker = any(tok.lower_ in speaker_terms for tok in doc)
     present_action = any(
         tok.pos_ == "VERB" and "Tense=Pres" in tok.morph for tok in doc
     )
@@ -136,19 +139,16 @@ def has_transactional_intent(text):
 
 def is_idea_focused(text):
     doc = nlp(text)
-
     abstract_terms = sum(tok.pos_ == "NOUN" and tok.ent_type_ == "" for tok in doc)
-
     promotional_verbs = sum(
         tok.lemma_.lower() in {"buy", "register", "join", "sign"} for tok in doc
     )
-
     return abstract_terms > 4 and promotional_verbs == 0
 
 
-def company_intent_override(text):
+def company_intent_override(text, company_name):
     doc = nlp(text)
-    if is_company_hosted(doc):
+    if is_company_hosted(doc, company_name):
         if (
             has_basic_promo(doc)
             and has_event_metadata(doc)
@@ -160,18 +160,14 @@ def company_intent_override(text):
     return None, None
 
 
-def intent_resolver(text, base_label):
+def intent_resolver(text, base_label, company_name):
     if base_label == "thought leadership" and is_idea_focused(text):
         return "thought leadership", "idea_dominant"
-
-    override, reason = company_intent_override(text)
+    override, reason = company_intent_override(text, company_name)
     if override:
         return override, reason
-
-    doc = nlp(text)
     if has_transactional_intent(text):
         return "events", "true_event_signal"
-
     return base_label, "model_fallback"
 
 
@@ -202,6 +198,8 @@ test_df.drop_duplicates(subset=["Social Copy"], inplace=True)
 train_df = train_df[train_df["Social Copy"].str.len() > 10]
 test_df = test_df[test_df["Social Copy"].str.len() > 10]
 
+test_df["Company"] = test_df["Company"].fillna("").astype(str).str.strip().str.lower()
+
 y_train = train_df["Content Pillar"]
 y_test = test_df["Content Pillar"]
 
@@ -226,9 +224,9 @@ ALLOWED_SECOND_LAYER = {"events", "thought leadership"}
 final_preds = []
 reasons = []
 
-for text, base in zip(test_df["Social Copy"], base_preds):
+for text, base, company in zip(test_df["Social Copy"], base_preds, test_df["Company"]):
     if base in ALLOWED_SECOND_LAYER:
-        label, reason = intent_resolver(text, base)
+        label, reason = intent_resolver(text, base, company)
     else:
         label, reason = base, "base_only"
     final_preds.append(label)
